@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://hapiledear.github.io</id>
+    <title>数据胡</title>
+    <updated>2023-03-12T06:55:20.950Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://hapiledear.github.io"/>
+    <link rel="self" href="https://hapiledear.github.io/atom.xml"/>
+    <subtitle>仓库管理员|是湖不是福。来，跟我一起读 湖南的fu</subtitle>
+    <logo>https://hapiledear.github.io/images/avatar.png</logo>
+    <icon>https://hapiledear.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2023, 数据胡</rights>
+    <entry>
+        <title type="html"><![CDATA[GFS第四讲--数据写入流程]]></title>
+        <id>https://hapiledear.github.io/gfs-c4/</id>
+        <link href="https://hapiledear.github.io/gfs-c4/">
+        </link>
+        <updated>2023-03-12T06:42:53.000Z</updated>
+        <content type="html"><![CDATA[<p>在上一篇文章中，我们学到了租约机制.这里，将会正式用到它对我们数据的写入顺序做一个保证。<br>
+<img src="https://hapiledear.github.io/post-images/1678603677776.png" alt="" loading="lazy"></p>
+<h1 id="控制流">控制流</h1>
+<ol>
+<li>client请求Master关于数据块及其副本位置的信息，当然还包括哪个chunkServer的数据块是目前持有租约的。如果此时还没有主块，master将从众多副本中选出一个赋予租约。</li>
+<li>Master返回报文中包含 唯一的主块信息及剩余的副本位置信息。client缓存这些数据以便之后的修改操作(减少与master的交互)。当 主块变得不可请求 或 主块不再持有租约时，client才需要再次请求master。</li>
+<li>client将数据<strong>推送</strong>[push]到所有的副本,无需关注数据到达副本时的顺序性。每一个chunkServer将缓存这些数据在内部的<strong>LRU缓冲池</strong>中，直到数据被使用或被淘汰。通过使 数据流 与 控制流 解耦这一手段，我们可以 调度这一珍贵的基于网络拓扑的数据流而忽略哪个是主块，进而取得高性能。下文中的<strong>数据流</strong>这一节会进一步讨论这一点。</li>
+<li>一旦所有的副本都回复接收完了数据，client发送写请求给主块。该请求能够确定之前推送给所有副本的数据集合。主块将为他收到的所有修改分配一连串的序列号，这些修改可能来自不止一个client，这一连串的序列号提供了必要的序列化功能。主块将自己的<strong>状态</strong>(第二步中放入缓存的与本次处理有关的数据集)按照序列号的顺序排好序。</li>
+<li>主块转发写请求给所有的二级副本。每一个副本所接收的修改操作的顺序都和主块一致。</li>
+<li>当完成主块发送的修改操作后，二级副本都将&quot;成功完成操作&quot;报告给主块。</li>
+<li>主块回复client。任何副本遇到的错误都将一并报告给client。在发生错误的情况下，对主块的写入操作可能是成功的，以及部分的二级副本也可能是成功的。（如果对主块的写操作失败，也就不会发生排序操作及其之后的操作。）同时，在发生错误的情况下，客户端的此次请求被认为是失败的，其修改的区域处于<strong>不一致</strong>状态。客户端代码会通过重试失败修改的方式处理这类错误.重试将会重复执行步骤3 到步骤7.</li>
+</ol>
+<h1 id="数据流">数据流</h1>
+<p>控制流的流程是 client -&gt; primary -&gt; all secondaries,数据是以流水线的方式由chunkServer精心挑选的顺序线性推送的。<br>
+为了充分利用每一台机器的带宽，数据沿着chunkServer选定的链路进行<strong>线性地推送</strong>。避免<strong>网络瓶颈</strong>和高延迟连接，并减少推送这些数据时的延迟。<br>
+为了尽可能的避免网络瓶颈和高延迟，每台机器都将数据转发到<strong>网络拓扑</strong>中最近的还未收到数据的机器。<br>
+最后，我们通过TCP连接的管道传输数据(TCP长连接)来降低延迟。一旦某一个chunkServer接收到数据，它立即开始向外分发。</p>
+<h1 id="总结">总结</h1>
+<p>数据流：指的是这一组操作，以<strong>最快的速度</strong>抵达<strong>距离最近</strong>的目标机器。而不保证这组操作的先后顺序。<br>
+控制流：主块先在自己的内存中，将这一组数据做一个排序。先自己执行，无错误后，再广播这个<strong>排序</strong>到各个从块。<br>
+<strong>数据流 与 控制流 的解耦</strong>，妙就妙在它充分利用了网络特性并且解决了数据的顺序性问题。接收到的数据的顺序不重要，只要接收得快。而数据准确/顺序的保证是由主块一家独断，从块都和它保持一致的顺序就行。</p>
+<h1 id="加餐部分">加餐部分</h1>
+<p>🎁:造成网络瓶颈的原因有哪些？<br>
+🗝网络连接由三项组成：源地址:端口、网络传输通道、目的地址:端口，因此造成瓶颈问题可能出现在这三个地方。</p>
+<ol>
+<li>源地址端口不足。</li>
+<li>一台机器(物理机)的总端口数为 65535个。其中，0-1023段为公认端口，1024-49151段为服务(运行在机器上的进程)所使用的注册端口，而剩下的49152-65535为动态端口，任何服务都可申请。</li>
+<li>在使用jmeter进行性能测试，经常出现<code>Address already in use: connect</code> 问题，就是提示我们可用端口不足了。通常有两种解决办法<br>
+1. 修改最大可用端口数为65535<br>
+2. 不使用长连接(keep-alive)，超时时间设置得短一些</li>
+<li>网络传输通道瓶颈</li>
+<li>公网通道无法调优，但可通过 tracert 命令感知延迟</li>
+<li>如果是公司内网，则主要与传输介质、机器有关，app开发人员也无从下手调优</li>
+<li>目的地址端口</li>
+<li>受限于 最大连接数，可修改</li>
+<li>服务内部线程</li>
+<li>主要是修改线程池的相关参数</li>
+</ol>
+<p>🎁:什么是网络拓扑？<br>
+🗝网络拓扑结构是 由计算机组成的网络之间设备的分布情况以及连接状态.把它两画在图上就成了拓扑图。基本的拓扑结构有 网状、星型、混合型、环型和总线型。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[GFS第三讲--租约以及快照机制]]></title>
+        <id>https://hapiledear.github.io/gfs-c3/</id>
+        <link href="https://hapiledear.github.io/gfs-c3/">
+        </link>
+        <updated>2023-03-05T09:01:57.000Z</updated>
+        <content type="html"><![CDATA[<p>在讲GFS的写机制之前，得先打败这位BOSS身边的两名小怪--租约机制和快照机制。那么，就让我们开始吧。</p>
+<h1 id="租约lease机制">租约[Lease]机制</h1>
+<p><strong>租约</strong>机制的作用，是在写操作中(一个主块多个副本块)用以保持副本之间的数据的<strong>一致性</strong>(通过保证修改操作的顺序一致)。Master向其中一个数据块授予租约，我们称这个数据块为<strong>主块[primary]</strong>。主块为一连串的修改操作决定一个<strong>顺序</strong>，所有的副本都将按照此顺序执行修改操作。<br>
+一个租赁周期的默认时间为60秒。当修改开始时，主块可以附带在心跳消息中(与Master通信)进行租约的<strong>延期申请</strong>。Master有时也会尝试在租约过期之前<strong>撤回</strong>租约（如 快照操作 和 修改文件名操作）。即使Master与主块之间的<strong>通信中断</strong>了，当旧的租约过期后(60秒)，还是可以安全的授予另一个副本新的租约。<br>
+当master为数据块授权新的租约时，会更新数据块的<strong>版本号</strong>并且广播通知。这一机制(版本号)常用于垃圾回收中的<strong>过时副本探测</strong>。（之后的文章中会讲解）</p>
+<h1 id="快照snapshot机制">快照[Snapshot]机制</h1>
+<p>快照操作可以在几乎瞬时内制作<strong>文件的副本</strong>或是<strong>字典树</strong>，同时最小化暂停正在执行的修改请求的时间。可以用它来快速创建庞大数据集的副本分支(当然也包括副本的副本)。或是用它在<strong>实验性操作</strong>之前创建当前状态的检查点，之后可以轻松提交或是回滚更改。<br>
+快照机制的实现原理是copy-on-write技术，操作步骤如下：</p>
+<ol>
+<li>Master接收到制作副本的请求后，首先会<strong>撤销</strong>该文件对应的所有chunk上的所有<strong>租约</strong>。之后，clinet都不得不来询问master“谁是主块？”。也就给了master创建新副本的机会。</li>
+<li>master将制作快照这一操作写入磁盘日志文件。之后<strong>复制</strong>自己的<strong>元数据</strong>，复制产生的新快照文件 指向 与源文件相同的数据块。</li>
+<li>如果此时client想对数据块C进行写入操作，client会首先询问master当前的主块信息。Master<strong>探测到数据块C的引用计数大于1</strong>，将会推迟回应client的此次请求并且生成一个数据块C的新的块<strong>句柄</strong>。</li>
+<li>master要求每个当前持有C块的chunkService创建一个名为C的新块。通过这一方式(在与原始块相同的chunkServer上创建新块)，确保数据是在本地而非通过网络进行copy(加速，磁盘操作的速度是1通过00Mb网络的3倍有余)。</li>
+<li>master向其中的一个副本授予租约，并回复client 哪个块可以正常写入。而client不知道它刚刚进行了复制操作。</li>
+</ol>
+<h1 id="加餐部分">加餐部分</h1>
+<p>🎁: GFS的事务特性ACID 是如何实现的？<br>
+🗝原子性：通过写流程控制，要么全成功，要么全失败。<br>
+🗝 一致性：通过租约机制控制。<br>
+🗝持久性：通过日志追加写入的方式<br>
+🗝隔离性：GFS不提供在多线程环境下的数据强一致保证，只能保证副本之间的数据是一样的，但内容有可能的错误的。</p>
+<p>🎁: copy-on-write技术<br>
+COW是一种计算机程序设计领域的优化策略。其核心思想是，如果有多个调用者（callers）同时请求相同资源（如内存或磁盘上的数据存储），他们会共同获取相同的<strong>指针</strong>指向相同的资源，<strong>直到</strong>某个调用者试图修改资源的内容时，系统才会真正复制一份<strong>专用副本</strong>（private copy）给该调用者，而其他调用者所见到的最初的资源仍然保持不变。这过程对其他的调用者都是透明的（transparently）。此作法主要的优点是如果调用者没有修改该资源，就不会有副本（private copy）被建立，因此多个调用者只是读取操作时可以共享同一份资源。</p>
+<p>🎁: 数据块C的引用计数为什么大于1？<br>
+当 GFS 创建一个快照时，它并不立即复制 chunk，而是<strong>增加</strong> GFS 中 chunk 的<strong>引用计数</strong>，表示这个 chunk 被快照引用了，等到客户端修改这个 chunk 时，才需要在 chunkserver 中拷贝 chunk 的数据生成新的 chunk。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[GFS第二讲--元数据以及数据一致性]]></title>
+        <id>https://hapiledear.github.io/gfs-c2/</id>
+        <link href="https://hapiledear.github.io/gfs-c2/">
+        </link>
+        <updated>2023-02-26T09:26:51.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="元数据-metadata">元数据 MetaData</h1>
+<p>论文中的MetaData特指存储在Master中的信息，都存储在内存之中，它包括3个部分：</p>
+<ul>
+<li>文件和数据块的<strong>命名空间</strong>[nameSpace]。</li>
+<li>文件与数据块的<strong>对应关系</strong>。</li>
+<li>每个数据块及其副本的<strong>位置信息</strong>。</li>
+</ul>
+<p>其中，前两项使用<strong>操作日志</strong>的方法持久化到了磁盘。而第三部分--位置信息 则由chunkServer在<strong>心跳通信</strong>时进行上报更新。<br>
+值得注意的是，数据放入内存确实能提高响应速度，但GFS整体可存放的数据大小将受<strong>内存大小限制</strong>，且GFS系统是单一master，无法横向扩展，分布式存储元数据。为了节省宝贵的内存，我们使用<strong>前缀树</strong>这一结构存储我们的命名空间。</p>
+<h2 id="操作日志">操作日志</h2>
+<p>操作日志记录了元数据中，命名空间及数据块对应关系的改动(历史记录)。采用<strong>追加写入</strong>的方式，天然的提供了修改操作的<strong>顺序性</strong>。一旦操作被记录下来，就能通过 文件、数据块、时间戳(三者组成联合主键)唯一且持久化的确认一条操作记录。</p>
+<p>记录操作日志和修改内存中的元数据这两项操作应当对Client保持 原子性、可见性和持久性。</p>
+<ul>
+<li>原子性。只有写日志和修改内存 都成功了，此次操作才视为成功。如果修改内存失败，则可以通过回放日志的方式进行恢复。</li>
+<li>可见性。Client只获取内存中的元数据信息，因此将修改内存的操作放在最后。</li>
+<li>持久性。操作日志持久化到磁盘，并且，为了增强容错性，将制作副本存入其他机器。</li>
+</ul>
+<p>由于操作日志是不断的追加写入，该文件会变得越来越大。因此设立了<strong>检查点</strong>[checkPoint]机制，来为文件瘦身。</p>
+<ul>
+<li>checkPoint信息和结构与内存中的元数据一致，这样无需解析就可以加载到内存空间。</li>
+<li>为了不使Master对外停止服务，创建checkPoint使用的是切换文件机制：
+<ul>
+<li>当日志文件增长到某一大小时，切换到一个新的日志文件上记录操作，旧的日志文件用来建立checkPoint。</li>
+</ul>
+</li>
+<li>拥有了检查点后的恢复作业只需执行最近一次检checkPoint及其之后的操作记录即可。</li>
+<li>同样是容错性考虑，可以选择保留最近n+1次的checkPoint和相应的日志文件。</li>
+</ul>
+<h1 id="数据一致性">数据一致性</h1>
+<figure data-type="image" tabindex="1"><img src="https://hapiledear.github.io/post-images/1677403861814.PNG" alt="" loading="lazy"></figure>
+<p>由于有数据副本的存在，对一个数据块的改动操作，除了会在本机的数据块上执行外，还需要同步到副本块上执行完成，才算是修改成功(要保证<strong>原子性</strong>)。根据CAP理论和BASE理论，GFS并不保证数据的强一致性(C)，而只要求<strong>基本可用</strong>(BA)。因此，GFS的一致性级别由高到低分别为：</p>
+<ul>
+<li>Defined 可预期的。客户端读取任意副本的结果都一样 且 在并行情况下，自己的修改和预期一致。</li>
+<li>Consistent 一致的。所有的客户端读取到的数据都是一样的，无论它们读的是哪一个副本。但不保证副本内部数据的正确性(由并发修改引起的数据覆盖、重复等)。</li>
+<li>Undefined 不可预期的。 并发情况下造成的数据交叉、进而引发类似MySQL中的不可重复读问题。</li>
+<li>Inconsistent 不一致的。 在不同时段，不同客户端查询同一块的结果都不相同。</li>
+</ul>
+<h2 id="gfs落实一致性的方法">GFS落实一致性的方法</h2>
+<p>GFS采用追加写入+检查点机制的方式来实现宽松的一致性模型。</p>
+<ul>
+<li>记录的追加写入采用<strong>最少一次</strong>(at-least-once)方式，虽然会产生重复数据，但可以保证记录的持久化。</li>
+<li>在数据块上使用的checkPoint包括了该数据块的<strong>校验和</strong>。使用该校验和，客户端在读取时可以识别并丢弃填充字符和片段。<br>
+客户端在读取数据的时候，通过使用校验和来识别并丢弃填充字符，通过使用唯一标记将重复记录过滤出来。</li>
+</ul>
+<h1 id="加餐部分">加餐部分</h1>
+<p>🎁论文原文中的<strong>状态</strong>[State]一词该如何理解？<br>
+🗝状态，是相对于检查点，或者说是<strong>存档</strong>机制来说的(checkPoint的另一种翻译)。指代的是<strong>需要持久化的信息</strong>的集合。例如我们在玩电子游戏，打最终Boss时的存档动作。游戏中的存档是什么呢？我们角色的血量、金币、健康度等状态，还有世界坐标、关卡等信息。<br>
+🗝需要存什么，由游戏开发者决定。而相应的，我们的状态需要持久化哪些信息，由app的开发者决定。<br>
+🗝如果挑战Boss失败了，通过读档，我们还可以重新挑战。相应的，我们在checkPoint之后的操作失败了，也可以借助存档来快速恢复。</p>
+<p>🎁为什么数据块不存储在Master，而是由各个server定期上报？</p>
+<ol>
+<li>chunkServer的加入、离开、修改文件名、出错、重启等能够影响位置信息的情况实在是太多而且太频繁。采用chunkServer直接汇报的方式，一方面<strong>规避</strong>了这些情况下的处理，另一方面可以最大限度的减少master-chunkServer之间的通信，节省带宽。</li>
+<li>chunkServer的职责就是负责数据块的存储，它<strong>离位置信息是最近</strong>的。那么，在master上再去存一份一样的位置信息是没有多大意义的。</li>
+</ol>
+<p>🎁为什么会有一致性问题？<br>
+🗝GFS系统中，任何数据块都存在<strong>副本</strong>，而因为网络的不可靠，将一份内容同步到多个备份是需要时间的。（并非<strong>原子性</strong>的）在这个时间段内，任何一个部件（client，chunkserver以及网络而）出现问题，就会造成副本的不一致。</p>
+<p>🎁一致性和defined在GFS系统中到底指的是什么？</p>
+<ul>
+<li>一致性：任何一个<strong>副本</strong>都是一模一样的（但不保证它是defined的），因此无论何时、多少客户端去读取，看到的都是相同数据。</li>
+<li>defined：<strong>客户端</strong>的任何一个写操作都可以查到相应日志记录。</li>
+<li>undefined:通常客户端是发送一组写操作的，此时有多个客户端进行写操作时，就可能造成数据交叉，进而引发类似于MySQL事务中的 <strong>不可重复读</strong> 问题。</li>
+</ul>
+<p>🎁<strong>最少一次</strong>[at-least-once] 的理解<br>
+🗝数据在c-s的传输过程中，受到网络超时的影响，可能会发生两种结果：传送过程出现问题，服务端没有收到数据。返回成功消息时出现问题，服务端已经接收到消息。</p>
+<ul>
+<li>at-least-once 特指 在 接收方已经接收到消息但返回成功消息时出现问题，发送方将采取重复发送的方式。即接收方会收到多条重复数据，需要接收方支持幂等性。</li>
+<li>at-most-once 与at-least-once相反，发送方只发送一次数据，也不关心接收方是否收到</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[GFS第一讲--整体架构及数据读取流程]]></title>
+        <id>https://hapiledear.github.io/gfs-c1/</id>
+        <link href="https://hapiledear.github.io/gfs-c1/">
+        </link>
+        <updated>2023-02-26T09:15:48.000Z</updated>
+        <content type="html"><![CDATA[<p>素未谋面之人啊，很高兴您能点开这篇文章。这是我依据论文《GFS》-- google分布式文件系统写就的第一篇文章。我在阅读的过程中，产生出了许多疑惑，伴随而产生的是更多的不曾了解的作为前提的知识点，更重要的是，看后根本无法有效记住。针对这些问题，便有了这一篇阶段性总结的文章。我将采用一张图的形式，花费3-5分钟，讲透一个功能模块。希望你和我一样，看完能够有所收获。</p>
+<figure data-type="image" tabindex="1"><img src="https://hapiledear.github.io/post-images/1677403093420.PNG" alt="" loading="lazy"></figure>
+<p>现在，先来让我们认识图中的各大组件。不过，我们的第一课，只需要记住<strong>加粗</strong>部分，便能理解这篇文章。</p>
+<h1 id="gfs组件">GFS组件</h1>
+<h2 id="master">Master</h2>
+<p>Master具有三项重要任务：</p>
+<ol>
+<li>存储整个文件系统的元数据[metadata]信息,包括：<strong>命名空间</strong>[namespace]、访问权限[access control]、文件-数据块的<strong>映射关系</strong> 以及 数据块的<strong>位置信息</strong>[chunk location]</li>
+<li>负责整个系统的维护和调度。如：数据块的管理、垃圾回收和数据块在不同chunkServer之间的迁移(负载均衡以及副本制作)。</li>
+<li>与系统中的每一个chunkServer建立心跳连接，并通过此连接进行数据交换和状态收集。</li>
+</ol>
+<h2 id="数据块服务chunkserver-和-数据块chunk">数据块服务[ChunkServer] 和 数据块[Chunk]</h2>
+<p>数据块服务[chunkServer]负责数据块[chunk]的存储和写入。一个大文件，会按<strong>固定大小被拆分</strong>为多个数据块[chunk]，分散到不同的部署有chunkServer的机器上。此外，为了容灾性，每个数据块[chunk]也都有数个(默认3个)副本在不同的chunkServer上。<strong>客户端读</strong>取任意一个副本都是没有差别的。<br>
+在数据块[chunk]的创建过程中，master会给它分配一个64-bit的全局唯一ID，小名<strong>块句柄</strong>[chunk handle]</p>
+<h2 id="客户端client">客户端[Client]</h2>
+<p>GFS 系统对外提供的一套标准的文件操作API，以供其他app使用。具体功能是 与Master和ChunkServer<strong>建立连接，进行通信</strong>，实现文件操作的相关功能</p>
+<h1 id="数据读取流程">数据读取流程</h1>
+<ol>
+<li>因为每个数据块的大小都是固定的，客户端便可将一个标准的文件操作参数(文件名[file name]，偏移量[offset]) 转换为该文件的第x块[chunk index]。</li>
+<li>发送带有(file name,chunk index) 的请求给Master，得到相应的回复报文(chunk handle,chunk locations)。</li>
+<li>客户端挑一个距离最近的chunkServer建立通信。请求报文包括-- 块句柄和操作字节范围(chunk handle,byte range)</li>
+<li>最后，chunkServer响应报文，返回对应位置的数据(chunk data)</li>
+</ol>
+<h1 id="加餐部分">加餐部分</h1>
+<p>基础部分到此结束，下文是个人的一些思考和疑问，我称之为“加餐”。因为，为了面试，上面的知识点足够了。可要是为了学习，当然是多多益善。</p>
+<p>🎁整个系统是如何保证高性能、低延迟的？<br>
+🗝系统对提高性能做了如下的努力：</p>
+<ol>
+<li>将元数据信息存入了Master的内存中。</li>
+<li>为了减少client-master之间的交互，客户端每次请求Master，得到的结果也会自己缓存一份。</li>
+<li>clinet-chunkServer之间频繁的数据交换，使用的是长连接，可以降低短连接带来的握手时间消耗。</li>
+</ol>
+<p>🎁为什么要使用句柄来操作文件<br>
+🗝master为了整体系统的可靠性，会制作副本并移动数据块的存储位置。master自身的(对无效数据块的)垃圾回收，也会移动数据块的存储位置。而使用句柄，则可以屏蔽这层改动。</p>
+<p>🎁数据块的大小设置对整体性能有何影响?<br>
+🗝最基础的一点：数据块越大，代表着存储的数据量越多。那么：</p>
+<ul>
+<li>对其随机访问的速率也就越慢，相应的对顺序访问的速率越快。</li>
+<li>放入缓存的代价太大，因此需考虑其他方案。相反，如果一定要放入缓存，则只能将块大小改小。</li>
+<li>数据块越小，越容易产生存储碎片，就需要额外花时间去整理；而块越大，一次申请就能用许久，不易产生碎片。</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[千里之行，始于此处]]></title>
+        <id>https://hapiledear.github.io/hello-friends/</id>
+        <link href="https://hapiledear.github.io/hello-friends/">
+        </link>
+        <updated>2023-02-11T06:47:17.000Z</updated>
+        <content type="html"><![CDATA[<p>我，是众多中国程序员中的一员，学历最平凡、平时话又少的那种。虽说还没有到35岁（95年），可是为了应对这把达摩克利斯之剑，下定决心走向自己的专业化之路。</p>
+<p>我的经历本可不赘述，唯一值得说道的只有两家“大厂”的工作经验。外加上正值壮年，也有许多工作机会等待着我。只是，再这样胡乱投下去，顺着大厂的裁员周期而一次又一次的换工作，未免也太不负责任了（对自己）。与我同龄的人，从他的简历上看去，一直在从事着 交易、支付相关的工作，也都是大厂。而我们的前辈，更是往这条路上走得更远，总结并出版了一本《支付架构实战》。反观自己呢？虽有用处，可就像一块砖一样，哪里需要往哪里搬。先后经历过 支付-广告-社区-数据，参芜庞杂，无所累积。可幸到是，找到了自己愿意从事的细分行业—数据仓库建设，或者可以说是 数据中台建设。</p>
+<p>初入数据之门，是在一年前，亦是因为工作需要。随着业务体量变大，海量数据处理问题成了必然，数据仓库技术及使用他们的程序员应运而生。这一点，也在之前的广告工作中得以有所苗条。那时，我们组为了找寻一个既懂后端服务（业务）又能处理数据的人员，耗费了不少精力。之后，便有意向此方向发展。<br>
+可是，它还不够专业细分，还是无迹可循，最为关键的一点是，得经得住市场的考验。终于，在投递了n份简历，体验了多种业务场景下的面试之后，我的内心回应了我：数据中台建设。</p>
+<p>数据中台，是大数据+后端服务的集合。随着公司业务的发展，也是会必然出现的一个中台系统，极具价值。可是，要建设好她也不容易，庞杂且繁多的模块需要我们掌握。对我而言，借此机会从中台的使用者变成了建设者。今后的日子里，我将在此输出自己对数据中台建设，以及大数据方面的学习过程和成果。一同大家交流，创造。如若遇到成熟技术模块，将会从 基础、实战、进阶、调优、源码及横向对比 6方面进行描述，力求为大家奉上易懂的 基础教学、答疑解惑、揭露原理和实践应用。</p>
+<p>最近几篇文章，将从大数据的基石- Google大名鼎鼎的GFS和Map Reduce 两篇论文说起。而它，直接催生了Hadoop应用。</p>
+<p>记于 2023年2月11日，新冠疫情开放元年。</p>
+]]></content>
+    </entry>
+</feed>

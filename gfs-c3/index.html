@@ -1,0 +1,236 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GFS第三讲--租约以及快照机制 | 数据胡</title>
+<link rel="shortcut icon" href="https://hapiledear.github.io/favicon.ico?v=1678603923659">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://hapiledear.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="GFS第三讲--租约以及快照机制 | 数据胡 - Atom Feed" href="https://hapiledear.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="在讲GFS的写机制之前，得先打败这位BOSS身边的两名小怪--租约机制和快照机制。那么，就让我们开始吧。
+租约[Lease]机制
+租约机制的作用，是在写操作中(一个主块多个副本块)用以保持副本之间的数据的一致性(通过保证修改操作的顺序一致)..." />
+    <meta name="keywords" content="GFS,分布式系统" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://hapiledear.github.io">
+  <img class="avatar" src="https://hapiledear.github.io/images/avatar.png?v=1678603923659" alt="">
+  </a>
+  <h1 class="site-title">
+    数据胡
+  </h1>
+  <p class="site-description">
+    仓库管理员|是湖不是福。来，跟我一起读 湖南的fu
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+        <a href="https://www.zhihu.com/people/yuan-32-47" target="_blank">
+          <i class="ri-zhihu-line"></i>
+        </a>
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              GFS第三讲--租约以及快照机制
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-03-05
+              </span>
+              <span>
+                5 min read
+              </span>
+              
+                <a href="https://hapiledear.github.io/tag/GFS/" class="post-tag">
+                  # GFS
+                </a>
+              
+                <a href="https://hapiledear.github.io/tag/DistributeSystem/" class="post-tag">
+                  # 分布式系统
+                </a>
+              
+            </div>
+            
+              <img class="post-feature-image" src="https://hapiledear.github.io/post-images/gfs-c3.jpg" alt="">
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>在讲GFS的写机制之前，得先打败这位BOSS身边的两名小怪--租约机制和快照机制。那么，就让我们开始吧。</p>
+<h1 id="租约lease机制">租约[Lease]机制</h1>
+<p><strong>租约</strong>机制的作用，是在写操作中(一个主块多个副本块)用以保持副本之间的数据的<strong>一致性</strong>(通过保证修改操作的顺序一致)。Master向其中一个数据块授予租约，我们称这个数据块为<strong>主块[primary]</strong>。主块为一连串的修改操作决定一个<strong>顺序</strong>，所有的副本都将按照此顺序执行修改操作。<br>
+一个租赁周期的默认时间为60秒。当修改开始时，主块可以附带在心跳消息中(与Master通信)进行租约的<strong>延期申请</strong>。Master有时也会尝试在租约过期之前<strong>撤回</strong>租约（如 快照操作 和 修改文件名操作）。即使Master与主块之间的<strong>通信中断</strong>了，当旧的租约过期后(60秒)，还是可以安全的授予另一个副本新的租约。<br>
+当master为数据块授权新的租约时，会更新数据块的<strong>版本号</strong>并且广播通知。这一机制(版本号)常用于垃圾回收中的<strong>过时副本探测</strong>。（之后的文章中会讲解）</p>
+<h1 id="快照snapshot机制">快照[Snapshot]机制</h1>
+<p>快照操作可以在几乎瞬时内制作<strong>文件的副本</strong>或是<strong>字典树</strong>，同时最小化暂停正在执行的修改请求的时间。可以用它来快速创建庞大数据集的副本分支(当然也包括副本的副本)。或是用它在<strong>实验性操作</strong>之前创建当前状态的检查点，之后可以轻松提交或是回滚更改。<br>
+快照机制的实现原理是copy-on-write技术，操作步骤如下：</p>
+<ol>
+<li>Master接收到制作副本的请求后，首先会<strong>撤销</strong>该文件对应的所有chunk上的所有<strong>租约</strong>。之后，clinet都不得不来询问master“谁是主块？”。也就给了master创建新副本的机会。</li>
+<li>master将制作快照这一操作写入磁盘日志文件。之后<strong>复制</strong>自己的<strong>元数据</strong>，复制产生的新快照文件 指向 与源文件相同的数据块。</li>
+<li>如果此时client想对数据块C进行写入操作，client会首先询问master当前的主块信息。Master<strong>探测到数据块C的引用计数大于1</strong>，将会推迟回应client的此次请求并且生成一个数据块C的新的块<strong>句柄</strong>。</li>
+<li>master要求每个当前持有C块的chunkService创建一个名为C的新块。通过这一方式(在与原始块相同的chunkServer上创建新块)，确保数据是在本地而非通过网络进行copy(加速，磁盘操作的速度是1通过00Mb网络的3倍有余)。</li>
+<li>master向其中的一个副本授予租约，并回复client 哪个块可以正常写入。而client不知道它刚刚进行了复制操作。</li>
+</ol>
+<h1 id="加餐部分">加餐部分</h1>
+<p>🎁: GFS的事务特性ACID 是如何实现的？<br>
+🗝原子性：通过写流程控制，要么全成功，要么全失败。<br>
+🗝 一致性：通过租约机制控制。<br>
+🗝持久性：通过日志追加写入的方式<br>
+🗝隔离性：GFS不提供在多线程环境下的数据强一致保证，只能保证副本之间的数据是一样的，但内容有可能的错误的。</p>
+<p>🎁: copy-on-write技术<br>
+COW是一种计算机程序设计领域的优化策略。其核心思想是，如果有多个调用者（callers）同时请求相同资源（如内存或磁盘上的数据存储），他们会共同获取相同的<strong>指针</strong>指向相同的资源，<strong>直到</strong>某个调用者试图修改资源的内容时，系统才会真正复制一份<strong>专用副本</strong>（private copy）给该调用者，而其他调用者所见到的最初的资源仍然保持不变。这过程对其他的调用者都是透明的（transparently）。此作法主要的优点是如果调用者没有修改该资源，就不会有副本（private copy）被建立，因此多个调用者只是读取操作时可以共享同一份资源。</p>
+<p>🎁: 数据块C的引用计数为什么大于1？<br>
+当 GFS 创建一个快照时，它并不立即复制 chunk，而是<strong>增加</strong> GFS 中 chunk 的<strong>引用计数</strong>，表示这个 chunk 被快照引用了，等到客户端修改这个 chunk 时，才需要在 chunkserver 中拷贝 chunk 的数据生成新的 chunk。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#%E7%A7%9F%E7%BA%A6lease%E6%9C%BA%E5%88%B6">租约[Lease]机制</a></li>
+<li><a href="#%E5%BF%AB%E7%85%A7snapshot%E6%9C%BA%E5%88%B6">快照[Snapshot]机制</a></li>
+<li><a href="#%E5%8A%A0%E9%A4%90%E9%83%A8%E5%88%86">加餐部分</a></li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://hapiledear.github.io/gfs-c2/">
+              <h3 class="post-title">
+                GFS第二讲--元数据以及数据一致性
+              </h3>
+            </a>
+          </div>
+        
+
+        
+          
+            <link rel="stylesheet" href="https://unpkg.com/gitalk/dist/gitalk.css">
+<script src="https://unpkg.com/gitalk/dist/gitalk.min.js"></script>
+
+<div id="gitalk-container"></div>
+
+<script>
+
+  var gitalk = new Gitalk({
+    clientID: '819a90d7c1c0d5465359',
+    clientSecret: '3575e98f0ffb5ff023e7648a8d90d44d4c92530a',
+    repo: 'hapiledear.github.io',
+    owner: 'Hapiledear',
+    admin: ['Hapiledear'],
+    id: (location.pathname).substring(0, 49),      // Ensure uniqueness and length less than 50
+    distractionFreeMode: false  // Facebook-like distraction free mode
+  })
+
+  gitalk.render('gitalk-container')
+
+</script>
+
+          
+
+          
+        
+
+        <div class="site-footer">
+  
+  <a class="rss" href="https://hapiledear.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

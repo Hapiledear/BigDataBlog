@@ -1,0 +1,256 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GFS第一讲--整体架构及数据读取流程 | 数据胡</title>
+<link rel="shortcut icon" href="https://hapiledear.github.io/favicon.ico?v=1678603923659">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://hapiledear.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="GFS第一讲--整体架构及数据读取流程 | 数据胡 - Atom Feed" href="https://hapiledear.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="素未谋面之人啊，很高兴您能点开这篇文章。这是我依据论文《GFS》-- google分布式文件系统写就的第一篇文章。我在阅读的过程中，产生出了许多疑惑，伴随而产生的是更多的不曾了解的作为前提的知识点，更重要的是，看后根本无法有效记住。针对这些..." />
+    <meta name="keywords" content="GFS,分布式系统" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://hapiledear.github.io">
+  <img class="avatar" src="https://hapiledear.github.io/images/avatar.png?v=1678603923659" alt="">
+  </a>
+  <h1 class="site-title">
+    数据胡
+  </h1>
+  <p class="site-description">
+    仓库管理员|是湖不是福。来，跟我一起读 湖南的fu
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+        <a href="https://www.zhihu.com/people/yuan-32-47" target="_blank">
+          <i class="ri-zhihu-line"></i>
+        </a>
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              GFS第一讲--整体架构及数据读取流程
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-02-26
+              </span>
+              <span>
+                4 min read
+              </span>
+              
+                <a href="https://hapiledear.github.io/tag/GFS/" class="post-tag">
+                  # GFS
+                </a>
+              
+                <a href="https://hapiledear.github.io/tag/DistributeSystem/" class="post-tag">
+                  # 分布式系统
+                </a>
+              
+            </div>
+            
+              <img class="post-feature-image" src="https://hapiledear.github.io/post-images/gfs-c1.png" alt="">
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <p>素未谋面之人啊，很高兴您能点开这篇文章。这是我依据论文《GFS》-- google分布式文件系统写就的第一篇文章。我在阅读的过程中，产生出了许多疑惑，伴随而产生的是更多的不曾了解的作为前提的知识点，更重要的是，看后根本无法有效记住。针对这些问题，便有了这一篇阶段性总结的文章。我将采用一张图的形式，花费3-5分钟，讲透一个功能模块。希望你和我一样，看完能够有所收获。</p>
+<figure data-type="image" tabindex="1"><img src="https://hapiledear.github.io/post-images/1677403093420.PNG" alt="" loading="lazy"></figure>
+<p>现在，先来让我们认识图中的各大组件。不过，我们的第一课，只需要记住<strong>加粗</strong>部分，便能理解这篇文章。</p>
+<h1 id="gfs组件">GFS组件</h1>
+<h2 id="master">Master</h2>
+<p>Master具有三项重要任务：</p>
+<ol>
+<li>存储整个文件系统的元数据[metadata]信息,包括：<strong>命名空间</strong>[namespace]、访问权限[access control]、文件-数据块的<strong>映射关系</strong> 以及 数据块的<strong>位置信息</strong>[chunk location]</li>
+<li>负责整个系统的维护和调度。如：数据块的管理、垃圾回收和数据块在不同chunkServer之间的迁移(负载均衡以及副本制作)。</li>
+<li>与系统中的每一个chunkServer建立心跳连接，并通过此连接进行数据交换和状态收集。</li>
+</ol>
+<h2 id="数据块服务chunkserver-和-数据块chunk">数据块服务[ChunkServer] 和 数据块[Chunk]</h2>
+<p>数据块服务[chunkServer]负责数据块[chunk]的存储和写入。一个大文件，会按<strong>固定大小被拆分</strong>为多个数据块[chunk]，分散到不同的部署有chunkServer的机器上。此外，为了容灾性，每个数据块[chunk]也都有数个(默认3个)副本在不同的chunkServer上。<strong>客户端读</strong>取任意一个副本都是没有差别的。<br>
+在数据块[chunk]的创建过程中，master会给它分配一个64-bit的全局唯一ID，小名<strong>块句柄</strong>[chunk handle]</p>
+<h2 id="客户端client">客户端[Client]</h2>
+<p>GFS 系统对外提供的一套标准的文件操作API，以供其他app使用。具体功能是 与Master和ChunkServer<strong>建立连接，进行通信</strong>，实现文件操作的相关功能</p>
+<h1 id="数据读取流程">数据读取流程</h1>
+<ol>
+<li>因为每个数据块的大小都是固定的，客户端便可将一个标准的文件操作参数(文件名[file name]，偏移量[offset]) 转换为该文件的第x块[chunk index]。</li>
+<li>发送带有(file name,chunk index) 的请求给Master，得到相应的回复报文(chunk handle,chunk locations)。</li>
+<li>客户端挑一个距离最近的chunkServer建立通信。请求报文包括-- 块句柄和操作字节范围(chunk handle,byte range)</li>
+<li>最后，chunkServer响应报文，返回对应位置的数据(chunk data)</li>
+</ol>
+<h1 id="加餐部分">加餐部分</h1>
+<p>基础部分到此结束，下文是个人的一些思考和疑问，我称之为“加餐”。因为，为了面试，上面的知识点足够了。可要是为了学习，当然是多多益善。</p>
+<p>🎁整个系统是如何保证高性能、低延迟的？<br>
+🗝系统对提高性能做了如下的努力：</p>
+<ol>
+<li>将元数据信息存入了Master的内存中。</li>
+<li>为了减少client-master之间的交互，客户端每次请求Master，得到的结果也会自己缓存一份。</li>
+<li>clinet-chunkServer之间频繁的数据交换，使用的是长连接，可以降低短连接带来的握手时间消耗。</li>
+</ol>
+<p>🎁为什么要使用句柄来操作文件<br>
+🗝master为了整体系统的可靠性，会制作副本并移动数据块的存储位置。master自身的(对无效数据块的)垃圾回收，也会移动数据块的存储位置。而使用句柄，则可以屏蔽这层改动。</p>
+<p>🎁数据块的大小设置对整体性能有何影响?<br>
+🗝最基础的一点：数据块越大，代表着存储的数据量越多。那么：</p>
+<ul>
+<li>对其随机访问的速率也就越慢，相应的对顺序访问的速率越快。</li>
+<li>放入缓存的代价太大，因此需考虑其他方案。相反，如果一定要放入缓存，则只能将块大小改小。</li>
+<li>数据块越小，越容易产生存储碎片，就需要额外花时间去整理；而块越大，一次申请就能用许久，不易产生碎片。</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#gfs%E7%BB%84%E4%BB%B6">GFS组件</a>
+<ul>
+<li><a href="#master">Master</a></li>
+<li><a href="#%E6%95%B0%E6%8D%AE%E5%9D%97%E6%9C%8D%E5%8A%A1chunkserver-%E5%92%8C-%E6%95%B0%E6%8D%AE%E5%9D%97chunk">数据块服务[ChunkServer] 和 数据块[Chunk]</a></li>
+<li><a href="#%E5%AE%A2%E6%88%B7%E7%AB%AFclient">客户端[Client]</a></li>
+</ul>
+</li>
+<li><a href="#%E6%95%B0%E6%8D%AE%E8%AF%BB%E5%8F%96%E6%B5%81%E7%A8%8B">数据读取流程</a></li>
+<li><a href="#%E5%8A%A0%E9%A4%90%E9%83%A8%E5%88%86">加餐部分</a></li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://hapiledear.github.io/hello-friends/">
+              <h3 class="post-title">
+                千里之行，始于此处
+              </h3>
+            </a>
+          </div>
+        
+
+        
+          
+            <link rel="stylesheet" href="https://unpkg.com/gitalk/dist/gitalk.css">
+<script src="https://unpkg.com/gitalk/dist/gitalk.min.js"></script>
+
+<div id="gitalk-container"></div>
+
+<script>
+
+  var gitalk = new Gitalk({
+    clientID: '819a90d7c1c0d5465359',
+    clientSecret: '3575e98f0ffb5ff023e7648a8d90d44d4c92530a',
+    repo: 'hapiledear.github.io',
+    owner: 'Hapiledear',
+    admin: ['Hapiledear'],
+    id: (location.pathname).substring(0, 49),      // Ensure uniqueness and length less than 50
+    distractionFreeMode: false  // Facebook-like distraction free mode
+  })
+
+  gitalk.render('gitalk-container')
+
+</script>
+
+          
+
+          
+        
+
+        <div class="site-footer">
+  
+  <a class="rss" href="https://hapiledear.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

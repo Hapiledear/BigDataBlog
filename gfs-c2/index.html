@@ -1,0 +1,292 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GFS第二讲--元数据以及数据一致性 | 数据胡</title>
+<link rel="shortcut icon" href="https://hapiledear.github.io/favicon.ico?v=1678603923659">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://hapiledear.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="GFS第二讲--元数据以及数据一致性 | 数据胡 - Atom Feed" href="https://hapiledear.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="元数据 MetaData
+论文中的MetaData特指存储在Master中的信息，都存储在内存之中，它包括3个部分：
+
+文件和数据块的命名空间[nameSpace]。
+文件与数据块的对应关系。
+每个数据块及其副本的位置信息。
+
+其中，前两项..." />
+    <meta name="keywords" content="GFS,分布式系统" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://hapiledear.github.io">
+  <img class="avatar" src="https://hapiledear.github.io/images/avatar.png?v=1678603923659" alt="">
+  </a>
+  <h1 class="site-title">
+    数据胡
+  </h1>
+  <p class="site-description">
+    仓库管理员|是湖不是福。来，跟我一起读 湖南的fu
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+        <a href="https://www.zhihu.com/people/yuan-32-47" target="_blank">
+          <i class="ri-zhihu-line"></i>
+        </a>
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              GFS第二讲--元数据以及数据一致性
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-02-26
+              </span>
+              <span>
+                7 min read
+              </span>
+              
+                <a href="https://hapiledear.github.io/tag/GFS/" class="post-tag">
+                  # GFS
+                </a>
+              
+                <a href="https://hapiledear.github.io/tag/DistributeSystem/" class="post-tag">
+                  # 分布式系统
+                </a>
+              
+            </div>
+            
+              <img class="post-feature-image" src="https://hapiledear.github.io/post-images/gfs-c2.jpg" alt="">
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h1 id="元数据-metadata">元数据 MetaData</h1>
+<p>论文中的MetaData特指存储在Master中的信息，都存储在内存之中，它包括3个部分：</p>
+<ul>
+<li>文件和数据块的<strong>命名空间</strong>[nameSpace]。</li>
+<li>文件与数据块的<strong>对应关系</strong>。</li>
+<li>每个数据块及其副本的<strong>位置信息</strong>。</li>
+</ul>
+<p>其中，前两项使用<strong>操作日志</strong>的方法持久化到了磁盘。而第三部分--位置信息 则由chunkServer在<strong>心跳通信</strong>时进行上报更新。<br>
+值得注意的是，数据放入内存确实能提高响应速度，但GFS整体可存放的数据大小将受<strong>内存大小限制</strong>，且GFS系统是单一master，无法横向扩展，分布式存储元数据。为了节省宝贵的内存，我们使用<strong>前缀树</strong>这一结构存储我们的命名空间。</p>
+<h2 id="操作日志">操作日志</h2>
+<p>操作日志记录了元数据中，命名空间及数据块对应关系的改动(历史记录)。采用<strong>追加写入</strong>的方式，天然的提供了修改操作的<strong>顺序性</strong>。一旦操作被记录下来，就能通过 文件、数据块、时间戳(三者组成联合主键)唯一且持久化的确认一条操作记录。</p>
+<p>记录操作日志和修改内存中的元数据这两项操作应当对Client保持 原子性、可见性和持久性。</p>
+<ul>
+<li>原子性。只有写日志和修改内存 都成功了，此次操作才视为成功。如果修改内存失败，则可以通过回放日志的方式进行恢复。</li>
+<li>可见性。Client只获取内存中的元数据信息，因此将修改内存的操作放在最后。</li>
+<li>持久性。操作日志持久化到磁盘，并且，为了增强容错性，将制作副本存入其他机器。</li>
+</ul>
+<p>由于操作日志是不断的追加写入，该文件会变得越来越大。因此设立了<strong>检查点</strong>[checkPoint]机制，来为文件瘦身。</p>
+<ul>
+<li>checkPoint信息和结构与内存中的元数据一致，这样无需解析就可以加载到内存空间。</li>
+<li>为了不使Master对外停止服务，创建checkPoint使用的是切换文件机制：
+<ul>
+<li>当日志文件增长到某一大小时，切换到一个新的日志文件上记录操作，旧的日志文件用来建立checkPoint。</li>
+</ul>
+</li>
+<li>拥有了检查点后的恢复作业只需执行最近一次检checkPoint及其之后的操作记录即可。</li>
+<li>同样是容错性考虑，可以选择保留最近n+1次的checkPoint和相应的日志文件。</li>
+</ul>
+<h1 id="数据一致性">数据一致性</h1>
+<figure data-type="image" tabindex="1"><img src="https://hapiledear.github.io/post-images/1677403861814.PNG" alt="" loading="lazy"></figure>
+<p>由于有数据副本的存在，对一个数据块的改动操作，除了会在本机的数据块上执行外，还需要同步到副本块上执行完成，才算是修改成功(要保证<strong>原子性</strong>)。根据CAP理论和BASE理论，GFS并不保证数据的强一致性(C)，而只要求<strong>基本可用</strong>(BA)。因此，GFS的一致性级别由高到低分别为：</p>
+<ul>
+<li>Defined 可预期的。客户端读取任意副本的结果都一样 且 在并行情况下，自己的修改和预期一致。</li>
+<li>Consistent 一致的。所有的客户端读取到的数据都是一样的，无论它们读的是哪一个副本。但不保证副本内部数据的正确性(由并发修改引起的数据覆盖、重复等)。</li>
+<li>Undefined 不可预期的。 并发情况下造成的数据交叉、进而引发类似MySQL中的不可重复读问题。</li>
+<li>Inconsistent 不一致的。 在不同时段，不同客户端查询同一块的结果都不相同。</li>
+</ul>
+<h2 id="gfs落实一致性的方法">GFS落实一致性的方法</h2>
+<p>GFS采用追加写入+检查点机制的方式来实现宽松的一致性模型。</p>
+<ul>
+<li>记录的追加写入采用<strong>最少一次</strong>(at-least-once)方式，虽然会产生重复数据，但可以保证记录的持久化。</li>
+<li>在数据块上使用的checkPoint包括了该数据块的<strong>校验和</strong>。使用该校验和，客户端在读取时可以识别并丢弃填充字符和片段。<br>
+客户端在读取数据的时候，通过使用校验和来识别并丢弃填充字符，通过使用唯一标记将重复记录过滤出来。</li>
+</ul>
+<h1 id="加餐部分">加餐部分</h1>
+<p>🎁论文原文中的<strong>状态</strong>[State]一词该如何理解？<br>
+🗝状态，是相对于检查点，或者说是<strong>存档</strong>机制来说的(checkPoint的另一种翻译)。指代的是<strong>需要持久化的信息</strong>的集合。例如我们在玩电子游戏，打最终Boss时的存档动作。游戏中的存档是什么呢？我们角色的血量、金币、健康度等状态，还有世界坐标、关卡等信息。<br>
+🗝需要存什么，由游戏开发者决定。而相应的，我们的状态需要持久化哪些信息，由app的开发者决定。<br>
+🗝如果挑战Boss失败了，通过读档，我们还可以重新挑战。相应的，我们在checkPoint之后的操作失败了，也可以借助存档来快速恢复。</p>
+<p>🎁为什么数据块不存储在Master，而是由各个server定期上报？</p>
+<ol>
+<li>chunkServer的加入、离开、修改文件名、出错、重启等能够影响位置信息的情况实在是太多而且太频繁。采用chunkServer直接汇报的方式，一方面<strong>规避</strong>了这些情况下的处理，另一方面可以最大限度的减少master-chunkServer之间的通信，节省带宽。</li>
+<li>chunkServer的职责就是负责数据块的存储，它<strong>离位置信息是最近</strong>的。那么，在master上再去存一份一样的位置信息是没有多大意义的。</li>
+</ol>
+<p>🎁为什么会有一致性问题？<br>
+🗝GFS系统中，任何数据块都存在<strong>副本</strong>，而因为网络的不可靠，将一份内容同步到多个备份是需要时间的。（并非<strong>原子性</strong>的）在这个时间段内，任何一个部件（client，chunkserver以及网络而）出现问题，就会造成副本的不一致。</p>
+<p>🎁一致性和defined在GFS系统中到底指的是什么？</p>
+<ul>
+<li>一致性：任何一个<strong>副本</strong>都是一模一样的（但不保证它是defined的），因此无论何时、多少客户端去读取，看到的都是相同数据。</li>
+<li>defined：<strong>客户端</strong>的任何一个写操作都可以查到相应日志记录。</li>
+<li>undefined:通常客户端是发送一组写操作的，此时有多个客户端进行写操作时，就可能造成数据交叉，进而引发类似于MySQL事务中的 <strong>不可重复读</strong> 问题。</li>
+</ul>
+<p>🎁<strong>最少一次</strong>[at-least-once] 的理解<br>
+🗝数据在c-s的传输过程中，受到网络超时的影响，可能会发生两种结果：传送过程出现问题，服务端没有收到数据。返回成功消息时出现问题，服务端已经接收到消息。</p>
+<ul>
+<li>at-least-once 特指 在 接收方已经接收到消息但返回成功消息时出现问题，发送方将采取重复发送的方式。即接收方会收到多条重复数据，需要接收方支持幂等性。</li>
+<li>at-most-once 与at-least-once相反，发送方只发送一次数据，也不关心接收方是否收到</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li><a href="#%E5%85%83%E6%95%B0%E6%8D%AE-metadata">元数据 MetaData</a>
+<ul>
+<li><a href="#%E6%93%8D%E4%BD%9C%E6%97%A5%E5%BF%97">操作日志</a></li>
+</ul>
+</li>
+<li><a href="#%E6%95%B0%E6%8D%AE%E4%B8%80%E8%87%B4%E6%80%A7">数据一致性</a>
+<ul>
+<li><a href="#gfs%E8%90%BD%E5%AE%9E%E4%B8%80%E8%87%B4%E6%80%A7%E7%9A%84%E6%96%B9%E6%B3%95">GFS落实一致性的方法</a></li>
+</ul>
+</li>
+<li><a href="#%E5%8A%A0%E9%A4%90%E9%83%A8%E5%88%86">加餐部分</a></li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://hapiledear.github.io/gfs-c1/">
+              <h3 class="post-title">
+                GFS第一讲--整体架构及数据读取流程
+              </h3>
+            </a>
+          </div>
+        
+
+        
+          
+            <link rel="stylesheet" href="https://unpkg.com/gitalk/dist/gitalk.css">
+<script src="https://unpkg.com/gitalk/dist/gitalk.min.js"></script>
+
+<div id="gitalk-container"></div>
+
+<script>
+
+  var gitalk = new Gitalk({
+    clientID: '819a90d7c1c0d5465359',
+    clientSecret: '3575e98f0ffb5ff023e7648a8d90d44d4c92530a',
+    repo: 'hapiledear.github.io',
+    owner: 'Hapiledear',
+    admin: ['Hapiledear'],
+    id: (location.pathname).substring(0, 49),      // Ensure uniqueness and length less than 50
+    distractionFreeMode: false  // Facebook-like distraction free mode
+  })
+
+  gitalk.render('gitalk-container')
+
+</script>
+
+          
+
+          
+        
+
+        <div class="site-footer">
+  
+  <a class="rss" href="https://hapiledear.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>
